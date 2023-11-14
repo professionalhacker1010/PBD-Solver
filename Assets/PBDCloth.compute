@@ -1,0 +1,288 @@
+// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel VerletIntegrate //kernel 0
+#pragma kernel ConstrainDistance //kernel 1
+#pragma kernel EndStep //kernel 2
+
+uniform float _NumRopes;
+uniform float _ParticlesPerRope;
+
+uniform float _MaxParticles;
+uniform float _DeltaTime;
+uniform float3 _ExternalForce;
+uniform float _ConstraintDistance;
+uniform float3 _AnchorPosition; //start of rope
+uniform float _MaxBending;
+uniform float _NormalCompliance;
+uniform float3 _Normal;
+uniform float _Drag;
+
+//float3 _anchorPosition;
+
+uniform bool _MouseIsDown;
+uniform float3 _MousePosition;
+uniform float3 _OldMousePosition;
+uniform float _MouseInfluenceRadius;
+uniform bool _MouseShouldCut;
+
+uniform float _TearThreshold;
+uniform float _MaxStretching;
+
+//uniform float3 _SphereCenter;
+//uniform float _SphereRadius;
+
+struct VerletVertex {
+    float3 position;
+    float isAnchor;
+    float3 oldPosition;
+    float isConnected;
+    float rootIdx;
+    float isConnectedLeft;
+    float3 velocity;
+    float padding0;
+};
+
+RWStructuredBuffer<VerletVertex> _VerletVertexWriteBuffer;
+StructuredBuffer<VerletVertex> _VerletVertexReadBuffer;
+
+bool isCounterClockwise(float2 A, float2 B, float2 C){
+    return (C[1] - A[1]) * (B[0] - A[0]) > (B[1] - A[1]) * (C[0] - A[0]);
+}
+
+//check intersection of AB and CD
+bool intersect(float2 A, float2 B, float2 C, float2 D){
+    return isCounterClockwise(A, C, D) != isCounterClockwise(B, C, D) &&
+        isCounterClockwise(A, B, C) != isCounterClockwise(A, B, D);
+}
+
+[numthreads(64,1,1)]
+void VerletIntegrate (uint3 id : SV_DispatchThreadID)
+{
+    VerletVertex vertex = _VerletVertexReadBuffer[id.x];
+    VerletVertex prevVertex;
+    if (id.x - 1 >= 0) prevVertex = _VerletVertexReadBuffer[id.x - 1];
+    VerletVertex nextVertex;
+    if (id.x + 1 < _MaxParticles) nextVertex = _VerletVertexReadBuffer[id.x + 1];
+    VerletVertex rightVertex;
+    if (id.x + _ParticlesPerRope < _MaxParticles) rightVertex = _VerletVertexReadBuffer[id.x + _ParticlesPerRope];
+    VerletVertex leftVertex;
+    if (id.x - _ParticlesPerRope >= 0) leftVertex = _VerletVertexReadBuffer[id.x - _ParticlesPerRope]; 
+
+    if (vertex.isAnchor == 1.){
+        //_VerletVertexWriteBuffer[id.x].oldPosition = _VerletVertexWriteBuffer[id.x].position;
+        vertex.oldPosition = vertex.position;
+
+        uint3 ropeIdx = id.x / _ParticlesPerRope;
+        vertex.position[0] = _AnchorPosition[0] + (ropeIdx * _ConstraintDistance);
+        vertex.position[1] = _AnchorPosition[1];
+        vertex.position[2] = _AnchorPosition[2];
+    }
+    else{
+        //mouse interactions
+        if (_MouseIsDown){
+            //check cut for upwards constraint
+            if (_MouseShouldCut && id.x > 0 && vertex.isConnected){
+                //check intersection of line segments, to see if a cut has occurred on backwards constraint
+                if (intersect(vertex.position, prevVertex.position, _MousePosition, _OldMousePosition)){
+                    vertex.isConnected = 0.;
+                    vertex.rootIdx = id.x;
+                }
+            }
+            //check cut for left constraint
+            if (_MouseShouldCut && id.x >= _ParticlesPerRope && vertex.isConnectedLeft){
+                if (intersect(vertex.position, leftVertex.position, _MousePosition, _OldMousePosition)){
+                    vertex.isConnectedLeft = 0.;
+                }
+            }
+            if (!_MouseShouldCut){
+                //move the vertex towards the mouse position
+                float distanceMouseVertex = length(vertex.position - _MousePosition);
+                if (distanceMouseVertex < _MouseInfluenceRadius){
+                    vertex.oldPosition = vertex.position - (_MousePosition - _OldMousePosition);
+                }
+            }
+        }
+
+        //start step
+        float3 velocity = vertex.velocity;
+        velocity = ((vertex.position - vertex.oldPosition) / _DeltaTime) + _ExternalForce * _DeltaTime;
+
+        //drag
+        velocity *= saturate(1.0 - _Drag);
+        velocity *= (1 - _DeltaTime * _Drag);
+        velocity = lerp(velocity, 0., 1 - exp(-_Drag * _DeltaTime));
+
+        //terminal velocity
+        if (length(velocity) > 50) velocity = normalize(velocity) * 50.;
+        
+        //integrate position
+        vertex.oldPosition = vertex.position;
+        vertex.position = vertex.position + velocity * _DeltaTime;
+        //vertex.velocity = velocity;
+    }
+
+    _VerletVertexWriteBuffer[id.x] = vertex;
+}
+
+float3 ResolveConstraint(VerletVertex vertex, VerletVertex otherVertex){
+    float3 distance = vertex.position - otherVertex.position;
+    float distanceLength = length(distance);
+    float3 modVector = float3(0., 0., 0.);
+    if (distanceLength > _ConstraintDistance){
+        float3 constrainedDistance = (distance / distanceLength) * _ConstraintDistance;
+        float3 overshoot = distance - constrainedDistance;
+        modVector = -(overshoot / 2.);
+    }
+    return modVector;
+}
+
+//if height is too hgih, shorten it
+float3 ResolveBendConstraint(VerletVertex vertex, VerletVertex prevVertex, VerletVertex nextVertex, float idx){
+    float3 vectorPrevNext = nextVertex.position - prevVertex.position;
+    float3 vectorPrevNextHalf = vectorPrevNext / 2.;
+    float3 baseMidpoint = prevVertex.position + vectorPrevNextHalf;
+    float3 vectorMidbaseCurr = vertex.position - baseMidpoint;
+    float currHeight = length(vectorMidbaseCurr);
+
+    if (currHeight > (_MaxBending * _ConstraintDistance)){
+        float3 vectorMidbaseCurrCorrected = normalize(vectorMidbaseCurr) * _MaxBending * _ConstraintDistance;
+        
+        vertex.position = baseMidpoint + vectorMidbaseCurrCorrected;
+    }
+    return vertex.position;
+}
+
+float3 ResolveNormalBendConstraint(VerletVertex vertex, VerletVertex prevVertex, VerletVertex nextVertex, float idx){
+    //bend with normal of x axis
+    float idxInRope = (float)idx - (float)vertex.rootIdx;
+    if (idxInRope > _ParticlesPerRope - 2) return float3(0., 0., 0.);
+
+    float height = idxInRope / (float) _ParticlesPerRope;
+    float3 lineDir = normalize(nextVertex.position - prevVertex.position);
+    float3 rootNormal = _Normal;
+
+    lineDir = normalize(lerp(lineDir, rootNormal, pow(1.0 - height, 5))); //line dir is closer to original the farther down the rope
+
+    float3 v = vertex.position - prevVertex.position;
+    float d = dot(v, lineDir);
+
+    if (d < 0) d *= -1;
+
+    float3 closestPoint = prevVertex.position + lineDir * d;
+
+    float3 delta = closestPoint - vertex.position;
+
+    if (vertex.position.x != 0.0 && !isnan(delta).x){
+        return delta * _NormalCompliance;
+    }
+    return float3(0., 0., 0.);
+}
+
+float3 ResolveLongDistanceConstraint(VerletVertex vertex, VerletVertex rootVertex, uint3 numConstraints){
+    float3 toAnchor = vertex.position - rootVertex.position;
+    float longConstraintDistance = numConstraints * (_ConstraintDistance);
+    float toAnchorLength = length(toAnchor);
+    if (toAnchorLength > longConstraintDistance){
+        vertex.position = ((toAnchor / toAnchorLength)  * longConstraintDistance) + rootVertex.position;
+    }
+    return vertex.position;
+}
+
+[numthreads(64,1,1)]
+void ConstrainDistance (uint3 id : SV_DispatchThreadID)
+{
+    //update anchor position
+    VerletVertex vertex = _VerletVertexReadBuffer[id.x];
+    if (id.x >= vertex.rootIdx && id.x < vertex.rootIdx + 1){
+        VerletVertex verticalRootVertex = _VerletVertexReadBuffer[vertex.rootIdx];
+        vertex.position = verticalRootVertex.position + _Normal * _ConstraintDistance * (id.x - vertex.rootIdx);
+    }
+
+    //enforce distnace constraints if not an anchor
+    if (vertex.isAnchor == 0.){
+        VerletVertex prevVertex;
+        if (id.x - 1 >= 0) prevVertex = _VerletVertexReadBuffer[id.x - 1];
+        VerletVertex nextVertex;
+        if (id.x + 1 < _MaxParticles) nextVertex = _VerletVertexReadBuffer[id.x + 1];
+        VerletVertex rightVertex;
+        if (id.x + _ParticlesPerRope < _MaxParticles) rightVertex = _VerletVertexReadBuffer[id.x + _ParticlesPerRope];
+        VerletVertex leftVertex;
+        if (id.x - _ParticlesPerRope >= 0) leftVertex = _VerletVertexReadBuffer[id.x - _ParticlesPerRope];
+        
+        float3 correction = float3(0., 0., 0.);
+
+        //vertical bend constraint
+        if (id.x + 1 < _MaxParticles && id.x > 0 &&
+            nextVertex.isConnected == 1. && vertex.isConnected == 1.) 
+        {
+            vertex.position = ResolveBendConstraint(vertex, prevVertex, nextVertex, id.x);
+        }
+
+        //horizontal bend constraint
+        if (id.x + _ParticlesPerRope < _MaxParticles && id.x - _ParticlesPerRope >= 0 &&
+            rightVertex.isConnectedLeft == 1. && vertex.isConnectedLeft == 1.) 
+        {
+            vertex.position = ResolveBendConstraint(vertex, leftVertex, rightVertex, id.x);
+        }
+
+        //down constraint
+        if (id.x + 1 < _MaxParticles && nextVertex.isConnected == 1.)
+        {
+            correction += ResolveConstraint(vertex, nextVertex);
+        }
+
+        //up constraint
+        if (id.x - 1 >= 0 && id.x % _ParticlesPerRope != 0)
+        {
+            correction += ResolveConstraint(vertex, prevVertex);
+        }
+        
+        //right constraint
+        if (id.x + _ParticlesPerRope < _MaxParticles && rightVertex.isConnectedLeft == 1.)
+        {
+            correction += ResolveConstraint(vertex, rightVertex);
+        }
+
+        //left constraint
+        if (id.x - _ParticlesPerRope >= 0 && vertex.isConnectedLeft == 1.)
+        {
+            correction += ResolveConstraint(vertex, leftVertex);
+        }
+
+        vertex.position += correction;
+        correction = float3(0., 0., 0.);
+
+
+
+        //Check for new root (indicating a constraint has been cut)
+        //for (int i = id.x - 1; i > 0; i--){
+        //    VerletVertex tempVertex = _VerletVertexReadBuffer[i];
+        //    if (!tempVertex.isConnected){
+        //        vertex.rootIdx = i;
+        //        break;
+        //    }
+        //    if (tempVertex.rootIdx != vertex.rootIdx){
+        //        vertex.rootIdx = tempVertex.rootIdx;
+        //        break;
+        //    }
+        //}
+
+        VerletVertex verticalRootVertex = _VerletVertexReadBuffer[vertex.rootIdx];
+        //long distance vertical constraint
+        //if (vertex.isConnected == 1.) vertex.position = ResolveLongDistanceConstraint(vertex, verticalRootVertex, id.x - vertex.rootIdx);
+        
+        //long distance horizontal constraint
+        //uint3 ropeIdx = id.x / _ParticlesPerRope;
+        //float horizRootIdx = id.x % _ParticlesPerRope;
+        //VerletVertex horizontalRootVertex = _VerletVertexReadBuffer[horizRootIdx];
+        //vertex.position = ResolveLongDistanceConstraint(vertex, horizontalRootVertex, ropeIdx);
+    }
+    _VerletVertexWriteBuffer[id.x] = vertex;
+}
+
+[numthreads(64,1,1)]
+void EndStep (uint3 id : SV_DispatchThreadID)
+{
+    VerletVertex vertex = _VerletVertexReadBuffer[id.x];
+    vertex.velocity = ((vertex.position - vertex.oldPosition) / _DeltaTime);
+    _VerletVertexWriteBuffer[id.x] = vertex;
+}
